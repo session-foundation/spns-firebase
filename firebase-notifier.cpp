@@ -484,11 +484,16 @@ int run(int argc, char* argv[]) {
 
     sd_notify(0, "READY=1\nSTATUS=Started");
 
+    auto last_stats_log = std::chrono::steady_clock::now();
     // Schedule our system status update timer through *both* OMQ and quic::Loop event loops so that
     // if there is a problem with either one, we won't update it and the watchdog can kill us.
     omq->add_timer(
-            [&loop = hn->loop, &stats, &last_stats, &last_stats_mut] {
-                loop.call_get([&stats, &last_stats, &last_stats_mut] {
+            [&loop = hn->loop,
+             &stats,
+             &last_stats,
+             &last_stats_mut,
+             &last_stats_log]() mutable {
+                loop.call_get([&stats, &last_stats, &last_stats_mut, &last_stats_log] {
                     int64_t s = stats.success, rs = stats.retry_success, f = stats.failures;
 
                     // Go look up our notification rate by looking for oldest value up to a minute
@@ -512,7 +517,13 @@ int run(int argc, char* argv[]) {
                                 (s - ls) / secs, (f - lf) / secs);
                     }
                     auto stats = "{} notifs ({} w/ retry), {} failed{}"_format(s, rs, f, rate_info);
-                    log::debug(cat, "Stats: {}", stats);
+                    if (auto now = std::chrono::steady_clock::now();
+                        now >= last_stats_log + 59'500ms) {
+                        log::info(cat, "Stats: {}", stats);
+                        last_stats_log = now;
+                    } else {
+                        log::debug(cat, "Stats: {}", stats);
+                    }
                     sd_notify(0, "WATCHDOG=1\nSTATUS={}"_format(stats).c_str());
                 });
             },
