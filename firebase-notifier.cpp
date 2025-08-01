@@ -245,9 +245,12 @@ int run(int argc, char* argv[]) {
                 0;  // Failures (i.e. could not retry or too many failed retries)
     } stats;
 
+    std::unordered_set<std::string> bad_tokens;
+
     std::function<void(firebase::notification n, int code, std::string resp_body)> handle_response;
-    handle_response = [&hn, &stats, &handle_response](
+    handle_response = [&hn, &stats, &handle_response, &bad_tokens](
                               firebase::notification n, int code, std::string resp_body) {
+        bool invalid_token = false;
         bool hit_quota = false;
         // Error codes: see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
         switch (code) {
@@ -267,12 +270,9 @@ int run(int argc, char* argv[]) {
                                 "type.googleapis.com/google.firebase.fcm.v1.FcmError" &&
                         err_det0["errorCode"].get<std::string_view>() == "INVALID_ARGUMENT") {
                         log::warning(
-                                cat,
-                                "Device token {} is no longer valid; adding to ignore list",
-                                n.token);
-                        stats.failures++;
-                        hn->ignore(std::move(n.token));
-                        return;
+                                cat, "Device token {} is no longer valid; deleting it", n.token);
+                        invalid_token = true;
+                        break;
                     }
                 } catch (...) {
                 }
@@ -296,21 +296,16 @@ int run(int argc, char* argv[]) {
                 log::warning(
                         cat,
                         "Device token {} has not authorized us to send "
-                        "notifications; adding to ignore list",
+                        "notifications; deleting it",
                         n.token);
-                stats.failures++;
-                hn->ignore(std::move(n.token));
-                return;
+                invalid_token = true;
+                break;
             case 404:
                 // UNREGISTERED -- the token is not registered, perhaps because the token got
                 // refreshed, the app got uninstalled, etc.
-                log::warning(
-                        cat,
-                        "Device token {} unregistered from FCM; adding to ignore list",
-                        n.token);
-                stats.failures++;
-                hn->ignore(std::move(n.token));
-                return;
+                log::warning(cat, "Device token {} unregistered from FCM; deleting it", n.token);
+                invalid_token = true;
+                break;
             case 429:
                 // QUOTA_EXCEEDED -- we hit some sort of quota, but it could be
                 // either for this token specifically or for the project overall.
@@ -324,6 +319,13 @@ int run(int argc, char* argv[]) {
                         code,
                         n.token);
                 break;
+        }
+
+        if (invalid_token) {
+            stats.failures++;
+            bad_tokens.insert(n.token);
+            hn->ignore(std::move(n.token));
+            return;
         }
 
         double retry_seconds = 1 << n.attempts++;
@@ -515,6 +517,25 @@ int run(int argc, char* argv[]) {
                 });
             },
             1s);
+
+    omq->add_timer(
+            [&loop = hn->loop, &bad_tokens, &omq = *omq, &spns_cid, &notifier_id] {
+                auto bad = loop.call_get([&bad_tokens] {
+                    std::unordered_set<std::string> bad;
+                    std::swap(bad, bad_tokens);
+                    return bad;
+                });
+
+                log::debug(cat, "{} bad tokens to remove from SPNS", bad.size());
+                if (!bad.empty()) {
+                    omq.send(
+                            spns_cid,
+                            "admin.drop_registrations",
+                            notifier_id,
+                            oxenc::bt_serialize(bad));
+                }
+            },
+            15s);
 
     // Run forever/until we get a signal to stop
     int signum = 0;
