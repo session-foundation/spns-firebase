@@ -1,6 +1,7 @@
 #include "notification.hpp"
 
 #include <oxenc/bt_producer.h>
+#include <oxenc/bt_serialize.h>
 #include <oxenc/hex.h>
 #include <sodium/crypto_aead_xchacha20poly1305.h>
 #include <sodium/randombytes.h>
