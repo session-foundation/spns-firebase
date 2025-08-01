@@ -166,6 +166,8 @@ void HTTP2Notifier::check_multi_info() {
             }
             handles.erase(message->easy_handle);
             curl_multi_remove_handle(multi, message->easy_handle);
+            if (stopping && handles.empty())
+                last_stopped.set_value();
         } else {
             log::warning(
                     cat,
