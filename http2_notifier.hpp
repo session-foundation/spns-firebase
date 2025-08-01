@@ -17,6 +17,17 @@ struct event;
 namespace firebase {
 
 class HTTP2Notifier {
+  public:
+    // Event loop used for HTTP.  Can also be used externally (e.g. for scheduling retries or auth
+    // token updates).
+    oxen::quic::Loop loop;
+
+    // Version we send in notifications indicating our version (so that, in theory, clients can
+    // treat our responses differently in case we need to coordinate a behavioural change with
+    // android client updates).
+    static inline constexpr int VERSION = 2;
+
+  private:
     CURLM* multi;
     curl_socket_t sockfd;
 
@@ -54,15 +65,6 @@ class HTTP2Notifier {
     friend struct curl_context;
 
   public:
-    // Event loop used for HTTP.  Can also be used externally (e.g. for scheduling retries or auth
-    // token updates).
-    oxen::quic::Loop loop;
-
-    // Version we send in notifications indicating our version (so that, in theory, clients can
-    // treat our responses differently in case we need to coordinate a behavioural change with
-    // android client updates).
-    static inline constexpr int VERSION = 2;
-
     // Constructs a curl FCM notifier.  Constructing the object starts a thread to manage all curl
     // connections.  The thread stops during object destruction.
     //

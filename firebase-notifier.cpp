@@ -449,7 +449,6 @@ int run(int argc, char* argv[]) {
                 spns_cid,
                 "admin.service_stats",
                 notifier_id,
-                "firebase",
                 oxenc::bt_serialize(report));
     };
 
