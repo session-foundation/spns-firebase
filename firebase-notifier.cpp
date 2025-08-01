@@ -266,11 +266,11 @@ int run(int argc, char* argv[]) {
                     if (err_det0["@type"].get<std::string_view>() ==
                                 "type.googleapis.com/google.firebase.fcm.v1.FcmError" &&
                         err_det0["errorCode"].get<std::string_view>() == "INVALID_ARGUMENT") {
-                        stats.failures++;
                         log::warning(
                                 cat,
                                 "Device token {} is no longer valid; adding to ignore list",
                                 n.token);
+                        stats.failures++;
                         hn->ignore(std::move(n.token));
                         return;
                     }
@@ -298,6 +298,7 @@ int run(int argc, char* argv[]) {
                         "Device token {} has not authorized us to send "
                         "notifications; adding to ignore list",
                         n.token);
+                stats.failures++;
                 hn->ignore(std::move(n.token));
                 return;
             case 404:
@@ -307,6 +308,7 @@ int run(int argc, char* argv[]) {
                         cat,
                         "Device token {} unregistered from FCM; adding to ignore list",
                         n.token);
+                stats.failures++;
                 hn->ignore(std::move(n.token));
                 return;
             case 429:
