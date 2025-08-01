@@ -448,14 +448,14 @@ int run(int argc, char* argv[]) {
 
     omq->add_timer(ping_spns, std::chrono::seconds{hivemind_ping <= 0 ? 5 : hivemind_ping});
 
-    // Run this timer once a minute, refreshing if we have less than 30min validity left for the
-    // token.  That way even if we get a failure, we can still retry 29 times before the token
-    // actually becomes invalid, and if Google starts returning tokens with less than 30min
+    // Run this timer once a minute, refreshing if we have less than 20min validity left for the
+    // token.  That way even if we get a failure, we can still retry 19 times before the token
+    // actually becomes invalid, and if Google starts returning tokens with less than 20min
     // validity, at least we rate limit ourselves to one per minute.
     omq->add_timer(
             [&expires, &token, &authreq, &hn] {
                 auto now = std::chrono::system_clock::now();
-                if (expires > now + 30min)
+                if (expires > now + 20min)
                     return;
 
                 try {

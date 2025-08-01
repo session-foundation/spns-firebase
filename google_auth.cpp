@@ -2,7 +2,6 @@
 
 #include <fmt/chrono.h>
 #include <fmt/std.h>
-#include <pybind11/chrono.h>
 #include <pybind11/embed.h>
 #include <pybind11/pytypes.h>
 #include <pybind11/stl.h>
@@ -57,6 +56,7 @@ PyAuthRequestor::PyAuthRequestor(
         Credentials = py::module_::import("google.oauth2.service_account").attr("Credentials");
         Request = py::module_::import("google.auth.transport.requests").attr("Request");
         creds = Credentials.attr("from_service_account_file")(jot.u8string(), "scopes"_a = scopes);
+        UTC = py::module_::import("datetime").attr("UTC");
     } catch (py::error_already_set& e) {
         throw std::runtime_error{"Python interpreter initialization: {}"_format(e.what())};
     }
@@ -72,9 +72,20 @@ std::pair<std::string, std::chrono::system_clock::time_point> PyAuthRequestor::n
         throw std::runtime_error{"Auth token refresh failed: {}"_format(e.what())};
     }
 
-    std::pair<std::string, std::chrono::system_clock::time_point> result{
-            creds.attr("token").cast<std::string>(),
-            creds.attr("expiry").cast<std::chrono::system_clock::time_point>()};
+    std::pair<std::string, std::chrono::system_clock::time_point> result;
+    auto& [token, exp] = result;
+    token = creds.attr("token").cast<std::string>();
+
+    auto py_exp = creds.attr("expiry");
+    // Google returns a naive timezone with UTC values loaded into it, yuck.  So fix up Google's bad
+    // code by shoving the UTC timezone onto it:
+    if (py_exp.attr("tzinfo").is_none())
+        py_exp = py_exp.attr("replace")("tzinfo"_a = UTC);
+    // We also hit a pybind11 bug here that it completely ignores the tzinfo and always converts
+    // datetime by treating all its values as local times, so don't use that either:
+    exp = std::chrono::system_clock::time_point{
+            std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                    std::chrono::duration<double>{py_exp.attr("timestamp")().cast<double>()})};
 
     log::info(
             cat,

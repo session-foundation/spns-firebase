@@ -35,6 +35,7 @@ class __attribute__((visibility("hidden"))) PyAuthRequestor {
     py::object Credentials;
     py::object Request;
     py::object creds;
+    py::object UTC;
     const std::filesystem::path jot;
     std::string proj_id;
 
@@ -49,7 +50,7 @@ class __attribute__((visibility("hidden"))) PyAuthRequestor {
 
     // Requests a new Oauth2 token, which should be sent in a "Authorization: Bearer <TOKEN>"
     // header to authenticate HTTP requests, and the expiry time of the token (which appears to
-    // generally be 4 hours).
+    // generally be 1 hour).
     //
     // This is a synchronous request, and so shouldn't be done in the main processing thread!
     //
