@@ -42,9 +42,6 @@ enum class SUBSCRIBE : int {
     BAD_INPUT = 1,
     ERROR = 4,
 };
-std::string format_as(const SUBSCRIBE& s) {
-    return "{}"_format(static_cast<int>(s));
-}
 
 static auto cat = oxen::log::Cat("firebase");
 
@@ -226,18 +223,19 @@ int run(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             log::warning(cat, "Unable to parse notifier.validate JSON input: {}", e.what());
             m.send_reply(
-                    "{}"_format(SUBSCRIBE::BAD_INPUT),
+                    "{}"_format(static_cast<int>(SUBSCRIBE::BAD_INPUT)),
                     "Unparseable JSON notification request data");
             return;
         }
         if (token.empty()) {
             log::warning(cat, "notifier.validate called with empty notification token");
             m.send_reply(
-                    "{}"_format(SUBSCRIBE::BAD_INPUT), "Firebase device token cannot be empty");
+                    "{}"_format(static_cast<int>(SUBSCRIBE::BAD_INPUT)),
+                    "Firebase device token cannot be empty");
             return;
         }
         log::debug(cat, "notifier.validate validated token {}", token);
-        m.send_reply("{}"_format(SUBSCRIBE::OK), token);
+        m.send_reply("{}"_format(static_cast<int>(SUBSCRIBE::OK)), token);
     });
 
     struct {
@@ -445,11 +443,7 @@ int run(int argc, char* argv[]) {
             }
         }
 
-        omq->send(
-                spns_cid,
-                "admin.service_stats",
-                notifier_id,
-                oxenc::bt_serialize(report));
+        omq->send(spns_cid, "admin.service_stats", notifier_id, oxenc::bt_serialize(report));
     };
 
     omq->add_timer(ping_spns, std::chrono::seconds{hivemind_ping <= 0 ? 5 : hivemind_ping});
