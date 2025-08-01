@@ -46,3 +46,5 @@ target_link_libraries(firebase-notifier
     PkgConfig::SYSTEMD
     CURL::libcurl
 )
+
+install(TARGETS firebase-notifier)
