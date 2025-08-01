@@ -192,6 +192,11 @@ HTTP2Notifier::HTTP2Notifier(std::string_view project_id, std::string_view auth_
                 static_cast<HTTP2Notifier*>(arg)->on_timeout();
             },
             this);
+
+    ignored_cleaner = loop.call_every(15s, [this] {
+        auto now = std::chrono::system_clock::now();
+        std::erase_if(ignored, [&now](const auto& i) { return now >= i.second; });
+    });
 }
 
 void HTTP2Notifier::stop() {

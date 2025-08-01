@@ -38,7 +38,10 @@ class HTTP2Notifier {
 
     std::chrono::milliseconds req_timeout = 10s;
 
+    // Ignored tokens, because of a previous rejection by upstream Firebase.  The value is the
+    // expiry after which we will try sending to this token again.
     std::unordered_map<std::string, std::chrono::system_clock::time_point> ignored;
+    std::shared_ptr<oxen::quic::Ticker> ignored_cleaner;
 
     static int handle_socket_c(CURL* easy, curl_socket_t s, int action, void* userp, void* socketp);
     static int start_timeout_c(CURLM* multi, long timeout_ms, void* userp);

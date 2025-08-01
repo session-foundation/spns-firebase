@@ -26,6 +26,7 @@
 
 extern "C" {
 #include <pthread.h>
+#include <systemd/sd-daemon.h>
 }
 
 namespace firebase {
@@ -249,29 +250,48 @@ int run(int argc, char* argv[]) {
     std::function<void(firebase::notification n, int code, std::string resp_body)> handle_response;
     handle_response = [&hn, &stats, &handle_response](
                               firebase::notification n, int code, std::string resp_body) {
-        if (code == 200) {
-            log::trace(cat, "sent notification to {}", n.token);
-            return;
-        }
-
-        // cf. https://firebase.google.com/docs/cloud-messaging/error-codes
-        log::warning(cat, "notification to token {} returned HTTP error code {}", n.token, code);
-
-        // Error codes: see
-        // https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+        bool hit_quota = false;
+        // Error codes: see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
         switch (code) {
             case 200:
                 stats.success++;
+                if (n.attempts)
+                    stats.retry_success++;
                 log::trace(cat, "sent notification to {}", n.token);
                 return;
             case 400:
-                // This is a generic "INVALID_ARGUMENT".  We assume that it means
-                // the token is invalid, as the other reasons probably mean we
-                // provided malformed input.
+                // This is a generic "INVALID_ARGUMENT".  This could be a malformed request, or an
+                // invalid token.  There's a deeply nested value in the body that helps us
+                // distinguish:
+                try {
+                    auto err_det0 = nlohmann::json::parse(resp_body)["error"]["details"][0];
+                    if (err_det0["@type"].get<std::string_view>() ==
+                                "type.googleapis.com/google.firebase.fcm.v1.FcmError" &&
+                        err_det0["errorCode"].get<std::string_view>() == "INVALID_ARGUMENT") {
+                        stats.failures++;
+                        log::warning(
+                                cat,
+                                "Device token {} is no longer valid; adding to ignore list",
+                                n.token);
+                        hn->ignore(std::move(n.token));
+                        return;
+                    }
+                } catch (...) {
+                }
+
+                // Otherwise this is some other sort of error so log it and schedule a retry
                 log::warning(
-                        cat, "Device token {} is no longer valid; adding to ignore list", n.token);
-                hn->ignore(std::move(n.token));
-                return;
+                        cat, "Notification request returned 400 error with body:\n{}", resp_body);
+                break;
+            case 401:
+                // THIRD_PARTY_AUTH_ERROR.  This seems to be for when you are deeply truely cursed
+                // by having decided to use Firebase to send notifications to APNS to make sure that
+                // both Google and Apple get to see all your notifications.
+                log::warning(
+                        cat,
+                        "Notification request returned 401, this is unexpected!  Body:\n{}",
+                        resp_body);
+                break;
             case 403:
                 // SENDER_ID_MISMATCH -- the client app registered for FCM but
                 // apparently didn't include us as an allowed sender.
@@ -282,10 +302,20 @@ int run(int argc, char* argv[]) {
                         n.token);
                 hn->ignore(std::move(n.token));
                 return;
+            case 404:
+                // UNREGISTERED -- the token is not registered, perhaps because the token got
+                // refreshed, the app got uninstalled, etc.
+                log::warning(
+                        cat,
+                        "Device token {} unregistered from FCM; adding to ignore list",
+                        n.token);
+                hn->ignore(std::move(n.token));
+                return;
             case 429:
                 // QUOTA_EXCEEDED -- we hit some sort of quota, but it could be
                 // either for this token specifically or for the project overall.
-                log::warning(cat, "Exceeded quota sending to token {}; will retry soon", n.token);
+                log::warning(cat, "Exceeded quota sending to token {}; will retry in 60s", n.token);
+                hit_quota = true;
                 break;
             default:
                 log::warning(
@@ -306,9 +336,12 @@ int run(int argc, char* argv[]) {
                     "Too many notification attempts ({}) for token {}; dropping notification",
                     n.attempts,
                     n.token);
+            stats.failures++;
             return;
         }
 
+        if (hit_quota && retry_seconds < 60)
+            retry_seconds = 60;
         retry_seconds *= retry_jitter(rng);
 
         log::debug(cat, "Retrying push to token {} in {:.3f}s", n.token, retry_seconds);
@@ -366,13 +399,16 @@ int run(int argc, char* argv[]) {
 
     std::deque<std::tuple<std::chrono::steady_clock::time_point, int64_t, int64_t, int64_t>>
             last_stats;
+    std::mutex last_stats_mut;
 
-    auto ping_spns = [&spns_cid, &omq, &notifier_id, &stats, &last_stats] {
+    auto ping_spns = [&spns_cid, &omq, &notifier_id, &stats, &last_stats, &last_stats_mut] {
         omq->send(spns_cid, "admin.register_service", notifier_id);
 
         std::map<std::string, int64_t> report;
 
+        std::lock_guard ls_lock{last_stats_mut};
         auto now = std::chrono::steady_clock::now();
+
         while (!last_stats.empty() && now - std::get<0>(last_stats.front()) > 1h + 1min)
             last_stats.pop_front();
         auto& [now_, s, rs, f] =
@@ -449,10 +485,48 @@ int run(int argc, char* argv[]) {
             },
             1min);
 
+    sd_notify(0, "READY=1\nSTATUS=Started");
+
+    // Schedule our system status update timer through *both* OMQ and quic::Loop event loops so that
+    // if there is a problem with either one, we won't update it and the watchdog can kill us.
+    omq->add_timer(
+            [&loop = hn->loop, &stats, &last_stats, &last_stats_mut] {
+                loop.call_get([&stats, &last_stats, &last_stats_mut] {
+                    int64_t s = stats.success, rs = stats.retry_success, f = stats.failures;
+
+                    // Go look up our notification rate by looking for oldest value up to a minute
+                    // old in last_stats
+                    std::lock_guard ls_lock{last_stats_mut};
+                    using dseconds = std::chrono::duration<double>;
+                    auto now = std::chrono::steady_clock::now();
+                    auto thresh = now - 1min;
+                    std::string rate_info;
+                    auto it = std::lower_bound(
+                            last_stats.begin(),
+                            last_stats.end(),
+                            thresh,
+                            [](const auto& s, const auto& thresh) {
+                                return std::get<0>(s) < thresh;
+                            });
+                    if (it != last_stats.end()) {
+                        const auto& [t, ls, lrs, lf] = *it;
+                        double secs = dseconds{now - t}.count();
+                        rate_info = "; last min: {:.1f}n/s, {:.1f}f/s"_format(
+                                (s - ls) / secs, (f - lf) / secs);
+                    }
+                    auto stats = "{} notifs ({} w/ retry), {} failed{}"_format(s, rs, f, rate_info);
+                    log::debug(cat, "Stats: {}", stats);
+                    sd_notify(0, "WATCHDOG=1\nSTATUS={}"_format(stats).c_str());
+                });
+            },
+            1s);
+
     // Run forever/until we get a signal to stop
     int signum = 0;
     sigwait(&sigset, &signum);
     log::warning(cat, "Caught signal {}, shutting down", signum);
+    sd_notify(0, "STOPPING=1\nSTATUS=Shutting down");
+
     // Stop OxenMQ first so that we won't get new incoming pushes.  Pushes will back up on the SPNS
     // socket and get delivered to us when we restart and restablish the connection.
     log::info(cat, "Stopping OxenMQ...");
