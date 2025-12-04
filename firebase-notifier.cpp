@@ -168,7 +168,7 @@ int run(int argc, char* argv[]) {
     sigaddset(&sigset, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
 
-    std::optional<PyAuthRequestor> authreq;
+    std::optional<AuthRequestor> authreq;
     try {
         authreq.emplace(std::move(auth_file));
     } catch (const std::exception& e) {

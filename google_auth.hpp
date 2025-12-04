@@ -1,62 +1,47 @@
 #pragma once
 
-#include <pybind11/embed.h>
+#include <gnutls/abstract.h>
 
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <type_traits>
 
 namespace firebase {
 
 using namespace std::literals;
-namespace py = pybind11;
 
-// Retrieves a new auth token from our Google overlords, if they deign to allow it, for
-// accessing the firebase notification messaging API.
-//
-// We do this through an embedded Python interpreter that loads it via Python because the only
-// C++ offering available to do this is a truely hideous monorepo monstrosity (which of course
-// also brings in things like Google's gigantic, unpleasant Boost imitation (aka abseil).
-//
-// So for now we just do this via a synchronous Python call.
-//
-// We keep the interpreter around as long as you keep the PyAuthRequestor around so that
-// subsequent requests don't have to spend time starting up the interpreter and loading python
-// modules.
-//
-// This whole thing is basically only marginally better than shelling out to a Python
-// interpreter, but the alternatives of doing it all NIH or loading and maintaining use of a
-// massive C++ dependency are worse, and given that we only need to use this once every couple
-// hours seems bearable.
-
-class __attribute__((visibility("hidden"))) PyAuthRequestor {
+class AuthRequestor {
   private:
-    std::optional<pybind11::scoped_interpreter> interpreter;
-    py::object Credentials;
-    py::object Request;
-    py::object creds;
-    py::object UTC;
-    const std::filesystem::path jot;
-    std::string proj_id;
+    // Values we parse during construction from the Google-provided "service account" JSON web token
+    // file auth file (from which we make a "JWT", pronounced "jot" which makes sense because JWT
+    // contains two-thirds of WTF)
+    std::string proj_id;  // `project_id` from the jot
+    // Space-separated list of URL scope values.  The default is what we need for firebase
+    // messaging.
+    std::string scopes = "https://www.googleapis.com/auth/firebase.messaging"s;
+    std::string iss;  // because "iss" is how you spell "client_email"
+    std::string aud;  // and this is how you spell "token_uri"
+
+    struct privkey_deleter {
+        void operator()(gnutls_privkey_t priv) const noexcept;
+    };
+    std::unique_ptr<std::remove_pointer_t<gnutls_privkey_t>, privkey_deleter> priv;
 
   public:
-    // Takes the path to a Google-provided "service_account" JSON web token file (JWT, which,
-    // Google docs tell me, is produced "jot", in much the same way WTF is pronounced
-    // "GOO-gul").
-    explicit PyAuthRequestor(
-            std::filesystem::path jot,
-            const std::vector<std::string>& scopes = {
-                    "https://www.googleapis.com/auth/firebase.messaging"s});
+    // Takes the path to a Google-provided "service_account" JSON web token file
+    explicit AuthRequestor(std::filesystem::path jot);
 
-    // Requests a new Oauth2 token, which should be sent in a "Authorization: Bearer <TOKEN>"
-    // header to authenticate HTTP requests, and the expiry time of the token (which appears to
-    // generally be 1 hour).
+    // Requests a new Oauth2 token, which should be sent in a "Authorization: Bearer <TOKEN>" header
+    // to authenticate HTTP requests, and the expiry time of the token (which will usually be 1 hour
+    // from when it was requested).
     //
     // This is a synchronous request, and so shouldn't be done in the main processing thread!
     //
     // Throws if the request fails for some reason.
-    std::pair<std::string, std::chrono::system_clock::time_point> new_auth_token();
+    std::pair<std::string, std::chrono::sys_seconds> new_auth_token();
 
+    // Returns the project id we parsed out of the jot.
     const std::string& project_id() const { return proj_id; }
 };
 
