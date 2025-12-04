@@ -1,44 +1,32 @@
 #include "google_auth.hpp"
 
+#include <curl/curl.h>
 #include <fmt/chrono.h>
 #include <fmt/std.h>
-#include <pybind11/embed.h>
-#include <pybind11/pytypes.h>
-#include <pybind11/stl.h>
+#include <gnutls/abstract.h>
+#include <gnutls/crypto.h>
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
+#include <oxenc/base64.h>
 
 #include <chrono>
 #include <fstream>
-#include <mutex>
 #include <nlohmann/json.hpp>
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 #include <stdexcept>
-
-#include "util.hpp"
 
 namespace firebase {
 
 namespace log = oxen::log;
 
 using namespace log::literals;
-using namespace py::literals;
-
-static bool active = false;
-static std::mutex py_init_mutex;
 
 static auto cat = log::Cat("firebase.auth");
 
-PyAuthRequestor::PyAuthRequestor(
-        std::filesystem::path jot_, const std::vector<std::string>& scopes) :
-        jot{std::move(jot_)} {
-    {
-        std::lock_guard lock{py_init_mutex};
-        if (active)
-            // pybind11 won't allow us to hold multiple scoped interpreters at once
-            throw std::logic_error{
-                    "Multiple simultaneous PyAuthRequestor instances are not supported"};
-        active = true;
-    }
+AuthRequestor::AuthRequestor(std::filesystem::path jot) {
+
+    gnutls_global_init();
 
     log::debug(cat, "Parsing auth file {}", jot);
     auto jot_data = nlohmann::json::parse(std::ifstream{jot});
@@ -49,49 +37,157 @@ PyAuthRequestor::PyAuthRequestor(
     if (proj_id.empty())
         throw std::invalid_argument{"Invalid json auth file: 'project_id' is missing or empty"};
 
-    log::debug(cat, "Initializing Python interpreter");
-    try {
-        interpreter.emplace();
+    iss = jot_data.value("client_email", ""s);
+    if (iss.empty())
+        throw std::invalid_argument{"Invalid json auth file: 'client_email' is missing or empty"};
 
-        Credentials = py::module_::import("google.oauth2.service_account").attr("Credentials");
-        Request = py::module_::import("google.auth.transport.requests").attr("Request");
-        creds = Credentials.attr("from_service_account_file")(jot.u8string(), "scopes"_a = scopes);
-        UTC = py::module_::import("datetime").attr("UTC");
-    } catch (py::error_already_set& e) {
-        throw std::runtime_error{"Python interpreter initialization: {}"_format(e.what())};
+    aud = jot_data.value("token_uri", ""s);
+    if (aud.empty())
+        throw std::invalid_argument{"Invalid json auth file: 'token_uri' is missing or empty"};
+
+    auto priv_key = jot_data.at("private_key").get<std::string>();
+    if (priv_key.empty())
+        throw std::invalid_argument{"Invalid json auth file: 'private_key' is missing or empty"};
+
+    gnutls_datum_t pem_data{
+            .data = reinterpret_cast<unsigned char*>(priv_key.data()),
+            .size = static_cast<unsigned int>(priv_key.size())};
+
+    gnutls_x509_privkey_t x_priv;
+    gnutls_x509_privkey_init(&x_priv);
+    int ret = gnutls_x509_privkey_import(x_priv, &pem_data, GNUTLS_X509_FMT_PEM);
+    if (ret < 0) {
+        gnutls_x509_privkey_deinit(x_priv);
+        throw std::invalid_argument{
+                "Invalid json auth file: 'private_key' does not contain a valid PEM private key: {}"_format(
+                        gnutls_strerror(ret))};
     }
-    log::info(cat, "Authentication layer initialized for project {}", proj_id);
+
+    {
+        gnutls_privkey_t p;
+        gnutls_privkey_init(&p);
+        priv.reset(p);
+    }
+    ret = gnutls_privkey_import_x509(priv.get(), x_priv, 0);
+    if (ret < 0) {
+        gnutls_x509_privkey_deinit(x_priv);
+        throw std::invalid_argument{"Invalid json auth file: private_key import failed: {}"_format(
+                gnutls_strerror(ret))};
+    }
 }
 
-std::pair<std::string, std::chrono::system_clock::time_point> PyAuthRequestor::new_auth_token() {
+void AuthRequestor::privkey_deleter::operator()(gnutls_privkey_t priv) const noexcept {
+    gnutls_privkey_deinit(priv);
+}
+
+static std::string b64_url(std::string_view in) {
+    auto out = oxenc::to_base64_unpadded(in);
+    for (auto& c : out)
+        if (c == '+')
+            c = '-';
+        else if (c == '/')
+            c = '_';
+    return out;
+}
+
+static constexpr auto jot_header = R"({"alg":"RS256","typ":"JWT"})"sv;
+static const auto jot_header_b64 = b64_url(jot_header);
+
+std::pair<std::string, std::chrono::sys_seconds> AuthRequestor::new_auth_token() {
     log::debug(cat, "Initiating new auth token request");
+
+    auto iat = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+
+    auto claim_b64 = b64_url(nlohmann::json{
+            {"iss", iss},
+            {"scope", scopes},
+            {"aud", aud},
+            {"iat", iat.time_since_epoch().count()},
+            {"exp", (iat + 1h).time_since_epoch().count()}}
+                                     .dump());
+
+    std::string jot = "{}.{}"_format(jot_header_b64, claim_b64);
+
+    // Make the signature by doing a SHA256 of the above jot value, then RSA signing it:
+    std::array<unsigned char, 32> hash;
+    gnutls_hash_fast(GNUTLS_DIG_SHA256, jot.data(), jot.size(), hash.data());
+
+    const gnutls_datum_t digest{.data = hash.data(), .size = hash.size()};
+    gnutls_datum_t sig{};
+    if (int r = gnutls_privkey_sign_hash2(
+                priv.get(),
+                GNUTLS_SIGN_RSA_SHA256,  // RSA-PKCS#1 v1.5 with SHA-256
+                0,
+                &digest,
+                &sig);
+        r < 0)
+        throw std::runtime_error{"RSA-SHA256 signing failed: {}"_format(gnutls_strerror(r))};
+
+    fmt::format_to(
+            std::back_inserter(jot),
+            ".{}",
+            b64_url({reinterpret_cast<const char*>(sig.data), sig.size}));
+    gnutls_free(sig.data);
+
+    // Now submit the signed jot to google auth to get a bearer token we can use
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        throw std::runtime_error{"curl_easy_init failed"};
+
+    std::string postfields =
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={}"_format(
+                    jot);
+
+    curl_easy_setopt(curl, CURLOPT_URL, aud.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields.c_str());
+    std::string response;
+    curl_easy_setopt(
+            curl,
+            CURLOPT_WRITEFUNCTION,
+            +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+                auto* response = static_cast<std::string*>(userdata);
+                response->append(ptr, size * nmemb);
+                return size * nmemb;
+            });
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    CURLcode cr = curl_easy_perform(curl);
+    if (cr != CURLE_OK)
+        throw std::runtime_error("curl_easy_perform failed");
+
+    curl_easy_cleanup(curl);
+
+    nlohmann::json resp;
     try {
-        creds.attr("refresh")(Request());
-    } catch (const py::error_already_set& e) {
-        log::warning(cat, "Auth token refresh failed: {}", e.what());
-        throw std::runtime_error{"Auth token refresh failed: {}"_format(e.what())};
+        resp = nlohmann::json::parse(response);
+    } catch (const std::exception& e) {
+        log::warning(
+                cat, "Failed to parse OAuth token request response ({}):\n{}", e.what(), response);
+        throw std::runtime_error{"OAuth token request failed"};
     }
 
-    std::pair<std::string, std::chrono::system_clock::time_point> result;
-    auto& [token, exp] = result;
-    token = creds.attr("token").cast<std::string>();
+    std::pair<std::string, std::chrono::sys_seconds> result;
+    auto& [token, expiry] = result;
 
-    auto py_exp = creds.attr("expiry");
-    // Google returns a naive timezone with UTC values loaded into it, yuck.  So fix up Google's bad
-    // code by shoving the UTC timezone onto it:
-    if (py_exp.attr("tzinfo").is_none())
-        py_exp = py_exp.attr("replace")("tzinfo"_a = UTC);
-    // We also hit a pybind11 bug here that it completely ignores the tzinfo and always converts
-    // datetime by treating all its values as local times, so don't use that either:
-    exp = std::chrono::system_clock::time_point{
-            std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                    std::chrono::duration<double>{py_exp.attr("timestamp")().cast<double>()})};
-
-    log::info(
-            cat,
-            "New OAuth2 authorization token retrieved, expires in {} ({})",
-            friendly_duration(result.second - std::chrono::system_clock::now()),
-            result.second);
+    if (token = resp.value("access_token", ""s); token.empty()) {
+        log::warning(
+                cat,
+                "OAuth token request failed: no 'access_token' found in response:\n{}",
+                response);
+        throw std::runtime_error{"OAuth token request failed"};
+    }
+    if (auto tt = resp.value("token_type", "(missing)"); tt != "Bearer") {
+        log::warning(cat, "OAuth token request returned unexpected token type '{}'", tt);
+        throw std::runtime_error{"OAuth token request failed"};
+    }
+    if (auto exp_in = resp.value("expires_in", -1); exp_in >= 600) {
+        expiry = iat + std::chrono::seconds{exp_in};
+    } else {
+        log::warning(
+                cat,
+                "OAuth token request returned missing or abnormally short expiry: '{}'",
+                exp_in);
+        throw std::runtime_error{"OAuth token request failed"};
+    }
 
     return result;
 }

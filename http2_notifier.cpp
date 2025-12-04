@@ -246,6 +246,8 @@ void HTTP2Notifier::replace_headers(std::string_view auth_token) {
     headers = curl_slist_append(headers, "User-Agent: Session Push Notification Server/0");
     headers = curl_slist_append(headers, "Authorization: Bearer {}"_format(auth_token).c_str());
     req_headers.reset(headers, [](curl_slist* headers) { curl_slist_free_all(headers); });
+
+    log::info(cat, "OAuth token updated");
 }
 
 void HTTP2Notifier::update_auth_token(std::string auth_token) {
