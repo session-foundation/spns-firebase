@@ -1,10 +1,16 @@
 #pragma once
 
 #include <filesystem>
+#include <oxen/log/format.hpp>
 #include <string>
 #include <string_view>
 
-namespace firebase {
+namespace spns::notifier {
+
+namespace log = oxen::log;
+
+using namespace log::literals;
+using namespace std::literals;
 
 namespace file {
 
@@ -18,4 +24,4 @@ namespace file {
 
 std::string friendly_duration(std::chrono::nanoseconds dur);
 
-}  // namespace firebase
+}  // namespace spns::notifier

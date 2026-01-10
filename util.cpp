@@ -3,10 +3,8 @@
 #include <fstream>
 #include <oxen/log/format.hpp>
 
-using namespace std::literals;
-using namespace oxen::log::literals;
+namespace spns::notifier {
 
-namespace firebase {
 namespace file {
 
     std::string slurp(const std::filesystem::path& filename) {
@@ -48,4 +46,4 @@ std::string friendly_duration(std::chrono::nanoseconds dur) {
     return "{}{:.3f}s"_format(sign, std::chrono::duration<double>{dur}.count());
 }
 
-}  // namespace firebase
+}  // namespace spns::notifier

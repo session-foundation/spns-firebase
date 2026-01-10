@@ -10,14 +10,16 @@
 #include <oxen/log.hpp>
 #include <oxen/log/format.hpp>
 
-using namespace std::literals;
-using namespace oxen::log::literals;
-
-namespace firebase {
+namespace spns::notifier {
 
 namespace log = oxen::log;
 
-static auto cat = log::Cat("firebase.http");
+using namespace std::literals;
+using namespace log::literals;
+
+static auto cat = log::Cat("http");
+static auto cat_firebase = log::Cat("http.firebase");
+static auto cat_apns = log::Cat("http.apns");
 
 struct notify_context {
     std::shared_ptr<curl_slist> req_headers;
@@ -28,6 +30,11 @@ struct notify_context {
 };
 
 constexpr size_t RESPONSE_MAX = 100'000;
+
+const std::string HTTP2Notifier::user_agent =
+        "User-Agent: Session Push Notification Server/{}"_format(HTTP2Notifier::VERSION);
+
+static const std::string content_type_json = "Content-Type: application/json; charset=UTF-8";
 
 namespace {
     extern "C" size_t body_accumulate(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -179,11 +186,9 @@ void HTTP2Notifier::check_multi_info() {
     }
 }
 
-HTTP2Notifier::HTTP2Notifier(std::string_view project_id, std::string_view auth_token) :
-        url{"https://fcm.googleapis.com/v1/projects/{}/messages:send"_format(project_id)} {
+HTTP2Notifier::HTTP2Notifier() {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    replace_headers(auth_token);
     multi = curl_multi_init();
     curl_multi_setopt(multi, CURLMOPT_SOCKETDATA, this);
     curl_multi_setopt(multi, CURLMOPT_SOCKETFUNCTION, &handle_socket_c);
@@ -239,21 +244,6 @@ HTTP2Notifier::~HTTP2Notifier() {
     });
 }
 
-void HTTP2Notifier::replace_headers(std::string_view auth_token) {
-
-    curl_slist* headers =
-            curl_slist_append(nullptr, "Content-Type: application/json; charset=UTF-8");
-    headers = curl_slist_append(headers, "User-Agent: Session Push Notification Server/0");
-    headers = curl_slist_append(headers, "Authorization: Bearer {}"_format(auth_token).c_str());
-    req_headers.reset(headers, [](curl_slist* headers) { curl_slist_free_all(headers); });
-
-    log::info(cat, "OAuth token updated");
-}
-
-void HTTP2Notifier::update_auth_token(std::string auth_token) {
-    loop.call([this, auth_token = std::move(auth_token)] { replace_headers(auth_token); });
-}
-
 void HTTP2Notifier::set_timeout(std::chrono::milliseconds timeout) {
     loop.call([this, timeout] { req_timeout = timeout; });
 }
@@ -268,19 +258,15 @@ void HTTP2Notifier::send(
         notification n,
         std::function<void(notification n, int code, std::string resp_body)> callback) {
 
-    auto body = nlohmann::json{{"message",
-                                {{"data",
-                                  {{"enc_payload", oxenc::to_base64(n.nonce_ciphertext)},
-                                   {"spns", "{}"_format(VERSION)}}},
-                                 {"token", n.token},
-                                 {"android", {{"priority", n.high_priority ? "high" : "normal"}}}}}}
-                        .dump();
+    auto [url, headers, body] = prepare(n);
 
     log::trace(cat, "About to send this for notification to {}:\n{}", n.token, body);
 
     loop.call([this,
                n = std::move(n),
                callback = std::move(callback),
+               url = std::move(url),
+               headers = std::move(headers),
                body = std::move(body)]() mutable {
         if (ignored.count(n.token)) {
             log::trace(cat, "ignore send to {}: token is on ignore list", n.token);
@@ -288,8 +274,8 @@ void HTTP2Notifier::send(
         }
 
         auto* h = curl_easy_init();
-        auto* ctx =
-                new notify_context{req_headers, std::move(body), std::move(n), std::move(callback)};
+        auto* ctx = new notify_context{
+                std::move(headers), std::move(body), std::move(n), std::move(callback)};
         curl_easy_setopt(h, CURLOPT_PRIVATE, ctx);
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, req_timeout.count());
         curl_easy_setopt(h, CURLOPT_NOPROGRESS, 1);
@@ -324,4 +310,104 @@ void HTTP2Notifier::send_later(
     });
 }
 
-}  // namespace firebase
+FirebaseHTTP::FirebaseHTTP(std::string_view project_id, std::string_view auth_token) :
+        url{"https://fcm.googleapis.com/v1/projects/{}/messages:send"_format(project_id)} {
+
+    replace_headers(auth_token);
+}
+
+void FirebaseHTTP::update_auth_token(std::string auth_token) {
+    loop.call([this, auth_token = std::move(auth_token)] { replace_headers(auth_token); });
+}
+
+template <std::same_as<std::string>... Header>
+    requires(sizeof...(Header) > 0)
+std::shared_ptr<curl_slist> make_headers(const Header&... s) {
+    curl_slist* headers = nullptr;
+    ((headers = curl_slist_append(headers, s.c_str())), ...);
+    return {headers, [](curl_slist* headers) { curl_slist_free_all(headers); }};
+}
+
+void FirebaseHTTP::replace_headers(std::string_view auth_token) {
+    req_headers = make_headers(
+            content_type_json, user_agent, "Authorization: Bearer {}"_format(auth_token));
+    log::info(cat_firebase, "OAuth token updated");
+}
+
+std::tuple<std::string, std::shared_ptr<curl_slist>, std::string> FirebaseHTTP::prepare(
+        const notification& n) {
+    std::tuple<std::string, std::shared_ptr<curl_slist>, std::string> result;
+    auto& [url, headers, body] = result;
+    headers = req_headers;
+    url = this->url;
+    body = nlohmann::json{{"message",
+                           {{"data",
+                             {{"enc_payload", oxenc::to_base64(n.nonce_ciphertext)},
+                              {"spns", "{}"_format(VERSION)}}},
+                            {"token", n.token},
+                            {"android", {{"priority", n.high_priority ? "high" : "normal"}}}}}}
+                   .dump();
+
+    return result;
+}
+
+APNSHTTP::APNSHTTP(std::string_view topic, std::string_view auth_token, bool sandbox) :
+        url_base{
+                sandbox ? "https://api.sandbox.push.apple.com/3/device/"sv
+                        : "https://api.push.apple.com/3/device/"sv},
+        topic_header{"apns-topic: {}"_format(topic)} {
+
+    replace_auth_token(auth_token);
+}
+
+void APNSHTTP::update_auth_token(std::string auth_token) {
+    loop.call([this, auth_token = std::move(auth_token)] { replace_auth_token(auth_token); });
+}
+void APNSHTTP::replace_auth_token(std::string_view auth_token) {
+    auth_header = "Authorization: bearer {}"_format(auth_token);
+    log::info(cat_apns, "Auth token updated");
+}
+
+std::tuple<std::string, std::shared_ptr<curl_slist>, std::string> APNSHTTP::prepare(
+        const notification& n) {
+    std::tuple<std::string, std::shared_ptr<curl_slist>, std::string> result;
+    auto& [url, headers, body] = result;
+
+    headers = make_headers(
+            content_type_json,
+            user_agent,
+            auth_header,
+            topic_header,
+            "apns-push-type: alert"s,
+            "apns-priority: 10"s,
+            "apns-expiration: {}"_format(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                            (std::chrono::system_clock::now() + notify_expiry).time_since_epoch())
+                            .count()));
+    // There is also apns-collapse-id which is sort of de-duplicating: it allows us to use a unique
+    // identifier so that we could deduplicate *pending* notifications, but it's not as useful as it
+    // seems (e.g. for multi-server SPNS) because it does do anything deduplication if a
+    // notification has already been delivered.  And so it might allow deduplication for offline
+    // devices, but might not dedupe for online devices which means we would still have to do that
+    // in the app.
+
+    url.reserve(url_base.size() + n.token.size());
+    url += url_base;
+    url += n.token;
+
+    body =
+            nlohmann::json{
+                    {"aps",
+                     {{"alert", {{"title", "Session"}, {"body", "New message"}}},
+                      {"badge", 1},
+                      {"sound", "default"},
+                      {"mutable-content", 1},
+                      {"category", "SECRET"}}},
+                    {"spns", "{}"_format(VERSION)},
+                    {"enc_payload", oxenc::to_base64(n.nonce_ciphertext)},
+            }
+                    .dump();
+    return result;
+}
+
+}  // namespace spns::notifier

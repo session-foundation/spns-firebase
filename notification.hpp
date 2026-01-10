@@ -4,11 +4,15 @@
 #include <string>
 #include <vector>
 
-namespace firebase {
+namespace spns::notifier {
 
-// Max message size we will include in the push notification.  Firebase notifications must be under
-// 4kiB, and we send this base64 encoded so 33% larger than this, plus extra metadata, encryption
-// overhead, and so on.
+// Max message size we will include in the push notification.  Firebase and APNS notifications must
+// be under 4kiB, and we send this base64 encoded so 33% larger than this, plus extra metadata,
+// encryption overhead, and so on.
+//
+// If the original message exceeds this, we omit the body and flag it as too large so that the
+// device can still see that it got a new message, but it will have to go to the swarm to actually
+// retrieve it.
 inline constexpr size_t MAX_MSG_SIZE = 2500;
 
 struct notification {
