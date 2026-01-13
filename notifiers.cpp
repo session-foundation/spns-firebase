@@ -52,6 +52,12 @@ NotifierBase::NotifierBase(CLI::App& app, std::string notifier_id_) :
                "subscribing to use this notification service.")
             ->capture_default_str();
 
+    app.add_flag(
+            "--no-unsubscribe",
+            no_unsubscribe,
+            "Disable automatic unsubscription of expired/invalid account IDs (for "
+            "testing/debugging purposes).");
+
     app.add_option(
             "--x25519-seed",
             x25519_seed,
@@ -219,11 +225,18 @@ void NotifierBase::start(oxen::quic::Loop& qloop) {
 
                 log::debug(cat, "{} bad tokens to remove from SPNS", bad.size());
                 if (!bad.empty()) {
-                    omq->send(
-                            spns_cid,
-                            "admin.drop_registrations",
-                            notifier_id,
-                            oxenc::bt_serialize(bad));
+                    if (no_unsubscribe)
+                        log::warning(
+                                cat,
+                                "{} registrations to be dropped, but ignoring because of "
+                                "--no-unsubscribe flag",
+                                bad.size());
+                    else
+                        omq->send(
+                                spns_cid,
+                                "admin.drop_registrations",
+                                notifier_id,
+                                oxenc::bt_serialize(bad));
                 }
             },
             15s);

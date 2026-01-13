@@ -41,6 +41,7 @@ class NotifierBase {
     int hivemind_ping = 5;
     std::filesystem::path x25519_seed;
     std::string log_level = "info";
+    bool no_unsubscribe = false;
 
     std::optional<oxenmq::OxenMQ> omq;
     oxenmq::ConnectionID spns_cid;
