@@ -10,7 +10,7 @@
 #include <oxen/log/format.hpp>
 #include <stdexcept>
 
-namespace firebase {
+namespace spns::notifier {
 
 using namespace oxen::log::literals;
 
@@ -60,26 +60,12 @@ notification notification::parse_spns(std::string_view data, std::string_view no
     if (token.empty())
         throw std::invalid_argument{"token is empty"};
 
-#if 0
     // FIXME: once oxenc 1.5 is released, this will work:
     auto account = d.require<std::span<const std::byte, 33>>("@");
 
     auto enc_key =
-            d.require<std::span<const unsigned char, crypto_aead_xchacha20poly1305_ietf_KEYBYTES>>("^");
-#else
-    auto account_fixme = d.require<std::span<const std::byte>>("@");
-    if (account_fixme.size() != 33)
-        throw std::invalid_argument{
-                "Invalid push data: account ID must be 33B, not {}B"_format(account_fixme.size())};
-    auto account = account_fixme.first<33>();
-
-    auto enc_key_fixme = d.require<std::span<const unsigned char>>("^");
-    if (enc_key_fixme.size() != crypto_aead_xchacha20poly1305_ietf_KEYBYTES)
-        throw std::invalid_argument{
-                "Invalid push data encryption key: expected {}B, not {}B"_format(
-                        crypto_aead_xchacha20poly1305_ietf_KEYBYTES, enc_key_fixme.size())};
-    auto enc_key = enc_key_fixme.first<crypto_aead_xchacha20poly1305_ietf_KEYBYTES>();
-#endif
+            d.require<std::span<const unsigned char, crypto_aead_xchacha20poly1305_ietf_KEYBYTES>>(
+                    "^");
 
     auto msg_ns = d.require<int16_t>("n");
     auto ts = d.require<int64_t>("t");
@@ -120,4 +106,4 @@ notification notification::parse_spns(std::string_view data, std::string_view no
             /*high_prio=*/msg_data && (msg_ns == 0 || msg_ns == 11)};
 }
 
-}  // namespace firebase
+}  // namespace spns::notifier

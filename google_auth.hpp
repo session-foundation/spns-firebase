@@ -1,13 +1,12 @@
 #pragma once
 
-#include <gnutls/abstract.h>
-
 #include <chrono>
 #include <filesystem>
 #include <string>
-#include <type_traits>
 
-namespace firebase {
+#include "auth_common.hpp"
+
+namespace spns::notifier::firebase {
 
 using namespace std::literals;
 
@@ -23,10 +22,7 @@ class AuthRequestor {
     std::string iss;  // because "iss" is how you spell "client_email"
     std::string aud;  // and this is how you spell "token_uri"
 
-    struct privkey_deleter {
-        void operator()(gnutls_privkey_t priv) const noexcept;
-    };
-    std::unique_ptr<std::remove_pointer_t<gnutls_privkey_t>, privkey_deleter> priv;
+    privkey_ptr priv;
 
   public:
     // Takes the path to a Google-provided "service_account" JSON web token file
@@ -45,4 +41,4 @@ class AuthRequestor {
     const std::string& project_id() const { return proj_id; }
 };
 
-}  // namespace firebase
+}  // namespace spns::notifier::firebase

@@ -16,7 +16,7 @@
 #include <oxen/log/format.hpp>
 #include <stdexcept>
 
-namespace firebase {
+namespace spns::notifier::firebase {
 
 namespace log = oxen::log;
 
@@ -25,8 +25,6 @@ using namespace log::literals;
 static auto cat = log::Cat("firebase.auth");
 
 AuthRequestor::AuthRequestor(std::filesystem::path jot) {
-
-    gnutls_global_init();
 
     log::debug(cat, "Parsing auth file {}", jot);
     auto jot_data = nlohmann::json::parse(std::ifstream{jot});
@@ -45,49 +43,11 @@ AuthRequestor::AuthRequestor(std::filesystem::path jot) {
     if (aud.empty())
         throw std::invalid_argument{"Invalid json auth file: 'token_uri' is missing or empty"};
 
-    auto priv_key = jot_data.at("private_key").get<std::string>();
+    auto priv_key = jot_data.at("private_key").get<std::string_view>();
     if (priv_key.empty())
         throw std::invalid_argument{"Invalid json auth file: 'private_key' is missing or empty"};
 
-    gnutls_datum_t pem_data{
-            .data = reinterpret_cast<unsigned char*>(priv_key.data()),
-            .size = static_cast<unsigned int>(priv_key.size())};
-
-    gnutls_x509_privkey_t x_priv;
-    gnutls_x509_privkey_init(&x_priv);
-    int ret = gnutls_x509_privkey_import(x_priv, &pem_data, GNUTLS_X509_FMT_PEM);
-    if (ret < 0) {
-        gnutls_x509_privkey_deinit(x_priv);
-        throw std::invalid_argument{
-                "Invalid json auth file: 'private_key' does not contain a valid PEM private key: {}"_format(
-                        gnutls_strerror(ret))};
-    }
-
-    {
-        gnutls_privkey_t p;
-        gnutls_privkey_init(&p);
-        priv.reset(p);
-    }
-    ret = gnutls_privkey_import_x509(priv.get(), x_priv, 0);
-    if (ret < 0) {
-        gnutls_x509_privkey_deinit(x_priv);
-        throw std::invalid_argument{"Invalid json auth file: private_key import failed: {}"_format(
-                gnutls_strerror(ret))};
-    }
-}
-
-void AuthRequestor::privkey_deleter::operator()(gnutls_privkey_t priv) const noexcept {
-    gnutls_privkey_deinit(priv);
-}
-
-static std::string b64_url(std::string_view in) {
-    auto out = oxenc::to_base64_unpadded(in);
-    for (auto& c : out)
-        if (c == '+')
-            c = '-';
-        else if (c == '/')
-            c = '_';
-    return out;
+    priv = load_privkey(priv_key);
 }
 
 static constexpr auto jot_header = R"({"alg":"RS256","typ":"JWT"})"sv;
@@ -192,4 +152,4 @@ std::pair<std::string, std::chrono::sys_seconds> AuthRequestor::new_auth_token()
     return result;
 }
 
-}  // namespace firebase
+}  // namespace spns::notifier::firebase
