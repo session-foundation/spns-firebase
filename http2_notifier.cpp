@@ -57,6 +57,10 @@ struct curl_context {
     HTTP2Notifier& hn;
     curl_socket_t sockfd;
     event* evt;
+    // Currently-armed libevent mask (0 means not armed).  Used to skip redundant
+    // event_del/event_add when libcurl asks us to poll for the same events we are already
+    // polling for, since each re-arm is an epoll_ctl syscall.
+    short armed_events = 0;
 
     curl_context(HTTP2Notifier& hn, curl_socket_t fd) :
             hn{hn},
@@ -130,15 +134,18 @@ int HTTP2Notifier::handle_socket_c(
 
             events |= EV_PERSIST;
 
-            event_del(curl_ctx->evt);
-            event_assign(
-                    curl_ctx->evt,
-                    hn.loop.get_event_base(),
-                    curl_ctx->sockfd,
-                    events,
-                    HTTP2Notifier::curl_perform_c,
-                    curl_ctx);
-            event_add(curl_ctx->evt, NULL);
+            if (events != curl_ctx->armed_events) {
+                event_del(curl_ctx->evt);
+                event_assign(
+                        curl_ctx->evt,
+                        hn.loop.get_event_base(),
+                        curl_ctx->sockfd,
+                        events,
+                        HTTP2Notifier::curl_perform_c,
+                        curl_ctx);
+                event_add(curl_ctx->evt, NULL);
+                curl_ctx->armed_events = events;
+            }
 
             break;
         case CURL_POLL_REMOVE:

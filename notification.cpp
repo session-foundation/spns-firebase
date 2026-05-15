@@ -60,7 +60,6 @@ notification notification::parse_spns(std::string_view data, std::string_view no
     if (token.empty())
         throw std::invalid_argument{"token is empty"};
 
-    // FIXME: once oxenc 1.5 is released, this will work:
     auto account = d.require<std::span<const std::byte, 33>>("@");
 
     auto enc_key =
