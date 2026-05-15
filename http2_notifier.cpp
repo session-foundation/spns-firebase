@@ -201,6 +201,10 @@ HTTP2Notifier::HTTP2Notifier() {
     curl_multi_setopt(multi, CURLMOPT_SOCKETFUNCTION, &handle_socket_c);
     curl_multi_setopt(multi, CURLMOPT_TIMERDATA, this);
     curl_multi_setopt(multi, CURLMOPT_TIMERFUNCTION, &start_timeout_c);
+    // Multiplex requests onto a single HTTP/2 connection per host (the default since libcurl
+    // 7.62, but set explicitly so that combined with CURLOPT_PIPEWAIT on each easy handle, new
+    // transfers wait for an in-flight connection rather than opening a parallel one).
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
 
     ev_timeout = evtimer_new(
             loop.get_event_base(),
@@ -288,6 +292,10 @@ void HTTP2Notifier::send(
         curl_easy_setopt(h, CURLOPT_NOPROGRESS, 1);
         curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
         curl_easy_setopt(h, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
+        // Wait for an in-flight connection to confirm multiplexability rather than opening a
+        // parallel connection.  Critical at high request rates: without this, the first burst of
+        // requests each opens its own TLS connection before the first one finishes handshaking.
+        curl_easy_setopt(h, CURLOPT_PIPEWAIT, 1L);
         curl_easy_setopt(h, CURLOPT_POST, 1);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, ctx->req_headers.get());
